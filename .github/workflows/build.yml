@@ -1,0 +1,120 @@
+name: Build Baig Pandoc GUI True Portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 ZIP-only portable builder
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout independent builder repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure stable MSVC Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Initialize Visual Studio compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Clone official source and apply fail-closed patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --quiet --depth 1 https://github.com/baig/pandoc-gui.git upstream
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream clone failed.' }
+          $sha = (git -C upstream rev-parse HEAD).Trim()
+          Write-Host "Upstream commit: $sha"
+          python scripts/patch_portable.py --source upstream
+          if ($LASTEXITCODE -ne 0) { throw 'Source patch refused unexpected upstream changes.' }
+          git -C upstream diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Source patch whitespace check failed.' }
+          git -C upstream diff --binary -- package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json | Out-File -FilePath upstream/PORTABLE_PATCH.diff -Encoding utf8
+          # Record the newly-created capability file separately as it is not in git diff.
+          Copy-Item upstream/src-tauri/capabilities/portable.json upstream/PORTABLE_CAPABILITY.json -Force
+
+      - name: Compile Tauri application without installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location upstream
+          try {
+            npm install --no-fund --no-audit
+            if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+            $cli = (node -p 'require("./node_modules/@tauri-apps/cli/package.json").version').Trim()
+            if ($LASTEXITCODE -ne 0 -or $cli -ne '2.12.4') { throw "Tauri CLI version mismatch: $cli" }
+            $schema='node_modules/@tauri-apps/cli/config.schema.json'
+            if (!(Test-Path -LiteralPath $schema) -or !(Select-String -LiteralPath $schema -Pattern 'appDirectoriesOverride' -SimpleMatch -Quiet)) {
+              throw 'Tauri CLI schema lacks portable app directory override'
+            }
+            $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+            if ($conf.app.withGlobalTauri -ne $true -or $conf.app.appDirectoriesOverride -ne '../Data/Tauri') { throw 'Portable Tauri configuration missing.' }
+            if ($conf.app.security.capabilities[0] -ne 'portable') { throw 'Dialog capability missing.' }
+            npm run tauri -- build --no-bundle
+            if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
+          } finally { Pop-Location }
+
+      - name: Compile native launcher with original icon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item upstream/src-tauri/icons/icon.ico launcher/app.ico -Force
+          Push-Location launcher
+          try {
+            & rc.exe /nologo /foapp.res app.rc
+            if ($LASTEXITCODE -ne 0) { throw 'Windows resource compilation failed.' }
+            & cl.exe /nologo /std:c++17 /EHsc /MT /O2 /W3 /utf-8 /DUNICODE /D_UNICODE /Fe:BaigPandocGUIPortable.exe launcher.cpp app.res /link /SUBSYSTEM:WINDOWS advapi32.lib user32.lib shell32.lib
+            if ($LASTEXITCODE -ne 0) { throw 'Native launcher compilation failed.' }
+          } finally { Pop-Location }
+
+      - name: Verify official Pandoc and package complete portable app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/package.ps1 -Upstream (Join-Path $pwd 'upstream') -BuilderRoot $pwd -Launcher (Join-Path $pwd 'launcher/BaigPandocGUIPortable.exe')
+          $base=Join-Path $pwd 'dist/BaigPandocGUIPortable'
+          foreach ($rel in @('BaigPandocGUIPortable.exe','App/BaigPandocGUI.exe','App/Tools/Pandoc/pandoc.exe','App/AppInfo/appinfo.ini','App/AppInfo/appicon.ico','Data/Tauri/KEEP.txt')) {
+            if (!(Test-Path -LiteralPath (Join-Path $base $rel) -PathType Leaf)) { throw "Portable package missing: $rel" }
+          }
+          Write-Host 'READY TO UPLOAD'
+
+      - name: Upload ZIP-only portable package (1 day)
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaigPandocGUIPortable-v2.0.0-win64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
+
+      - name: Upload patch diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaigPandocGUI-build-diagnostics
+          path: |
+            upstream/PORTABLE_PATCH_SUMMARY.txt
+            upstream/PORTABLE_PATCH.diff
+            upstream/PORTABLE_CAPABILITY.json
+            upstream/src-tauri/tauri.conf.json
+            upstream/src-tauri/target/release/build/**/stderr
+          retention-days: 1
+          if-no-files-found: ignore

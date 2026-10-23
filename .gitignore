@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+upstream/
+dist/
+launcher/*.exe
+launcher/*.res
+launcher/app.ico
+pandoc-official.zip
+pandoc-official-extract/
